@@ -1,0 +1,7 @@
+*.o
+.vscode
+bin/
+build/
+.idea
+*.iml
+__pycache__
