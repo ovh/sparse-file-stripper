@@ -1,0 +1,83 @@
+=======================================================================================================================
+Original file
++----+--------------------+--------------+----------------+------------+
+|Data|++++++ Sparse ++++++|   Data       |++++++++++++++++|    Data    |
+|R1  |++++++++ R1 ++++++++|    R2        |++++++++++++++++|     R3     |
++----+--------------------+--------------+----------------+------------+
+^    ^                    ^      ^       ^                ^
+D1   S1                   D2     B1      S2               D3
+
+D (dense offset), S (sparse offset), B (arbitrary offset where the read data hits the atomic block size boundary)
+
+=======================================================================================================================
+Backup/formatting step
+
+Data size <= User provided (default: 256MiB). Should be chosen according to the amount of memory planned to be available
+when inflating data. 256MiB is not a big requirement nowadays, hence the default value.
+
++--------+-------------------------------------------------------+------------------------------------------------------------+--------+
+|        |                     Atomic block 1                    |                     Atomic block 2                         |        |
+|        | +------+----------+----+---------+---------+--------+ | +------+----------+---------+---------+---------+--------+ |        |
+| random | | Data | optional |Data| Data R2 | Offsets |Offsets | | | Data | optional | Data R2 | Data R3 | Offsets |Offsets | |        |
+|  buf   | | Size |  random  |R1  |  part1  |  size   |        | | | Size |  random  |  part2  |         |  size   |        | | Footer |
+|        | |      |  buffer  |    |         |         |        | | |      |  buffer  |         |         |         |        | |        |
+| size   | +------+----------+----+---------+---------+--------+ | +------+----------+---------+---------+---------+--------+ |        |
+|        |                                  ^                    |                                       ^                    |        |
+|        |                      Data size (+ x if random buf)    |                        Data size (+ x if random buffer)    |        |
++--------+-------------------------------------------------------+------------------------------------------------------------+--------+
+
+Offsets:
+
+Let's take the offsets array in our atomic block 1 as example, every offset case below is sizeof(size_t) memory bytes
+long.
+
++--------+----------+---------+---------+
+| D1 = 0 | S1 - D1  | D2 - S1 | B1 - D2 |
++--------+----------+---------+---------+
+
+And we have: (S1 - D1) + (B1 - D2) == Data size
+
+Offsets array size: 4
+
+The second block offsets array:
+
++---+---------+---------+----------+
+| 0 | S2 - B1 | D3 - S2 | EOF - D3 |
++---+---------+---------+----------+
+
+Offsets array size: 4
+
+Size of one atomic block is variable, however we have an upper boundary (a worst case sceanario size)
+
+Worst scenario for offsets size: sparse and dense areas switch every sparse_block_min_size blocks (4096 bytes, hardcoded in our case),
+
+In such a case we have the following upper boundary:
+
+The maximum number of dense blocks: ceil(max_data_size/sparse_block_min_size) (= max_data_size/sparse_block_min_size because it is an integer)
+The maximum number of sparse blocks: max_data_size/sparse_block_min_size + 1
+By convention, we start the atomic block with a dense area, which we directly close if the data begins with a sparse zone
+So actually maximum number of dense blocks: max_data_size/sparse_block_min_size + 1
+
+Offset size <= (Max_data_size/sparse_block_min_size + 1) * 2 * sizeof(size_t)
+
+Practical rule of thumb: atomic block size < 1.001 * Max_data_size
+
+
+Footer:
+
+Fixed size structure (32 bytes) containing interesting statistics (could be made optional, to spare a few bytes):
+- read bytes
+- written bytes
+- compression ratio (redundant with the two numbers before)
+- number of atomic blocks
+
+=======================================================================================================================
+Inflate
+
+1. Read sizeof(size_t) bytes: extract the data_size for the next atomic block.
+2. Load data_size bytes.
+3. Extract offsets array using offset size info
+4. Browse offsets and inflate data:
+If data region: write
+If sparse region: attempts instant zeroing by calling falloc(mode=FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)
+If not supported, fallback to full zeroing (all inflate boost then lost)
